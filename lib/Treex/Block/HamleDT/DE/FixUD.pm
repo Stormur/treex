@@ -11,9 +11,39 @@ sub process_atree
 {
     my $self = shift;
     my $root = shift;
+    # Fix relations before morphology. The fixes depend only on UPOS tags, not on morphology (e.g. NOUN should not be attached as det).
+    # And with better relations we will be more able to disambiguate morphological case and gender.
+    $self->fix_det_nmod($root);
     $self->fix_morphology($root);
     $self->regenerate_upos($root);
     $self->fix_root_punct($root);
+    # Other relations will be fixed after morphology and we will use lemmas in the heuristics.
+    $self->fix_possessive_determiners($root);
+    $self->fix_infinitival_zu($root);
+    $self->fix_separable_verb_prefixes($root);
+    $self->fix_mwe($root);
+}
+
+
+
+#------------------------------------------------------------------------------
+# Fixes known issues in dependency relations.
+#------------------------------------------------------------------------------
+sub fix_det_nmod
+{
+    my $self = shift;
+    my $root = shift;
+    my @nodes = $root->get_descendants();
+    # Identify finite verbs first. We will need them later to disambiguate personal pronouns.
+    foreach my $node (@nodes)
+    {
+        my $parent = $node->parent();
+        # Genitive noun phrases are often attached as det while they should be nmod.
+        if($node->is_noun() && !$node->is_pronominal() && $parent->is_noun() && $node->deprel() =~ m/^det(:|$)/)
+        {
+            $node->set_deprel('nmod');
+        }
+    }
 }
 
 
@@ -704,6 +734,31 @@ sub fix_morphology
                 $iset->set('degree', $degree);
             }
         }
+        # Fix postpositions and circumpositions that the tagger mistook for separable verb prefixes.
+        if($stts eq 'PTKVZ' && $node->deprel() eq 'case')
+        {
+            # It probably does not precede the parent noun but if it does, it is a preposition.
+            my $ordadp = $node->ord();
+            my $ordnoun = $node->parent()->ord();
+            if($ordadp < $ordnoun)
+            {
+                $stts = 'APPR';
+            }
+            else
+            {
+                # If there is another case dependent before the noun, the case dependents together form a circumposition.
+                my $prep = any {$_->deprel() eq 'case' && $_->ord() < $ordnoun} ($node->parent()->children());
+                if($prep)
+                {
+                    $stts = 'APZR';
+                }
+                else
+                {
+                    $stts = 'APPO';
+                }
+            }
+            $node->set_conll_pos($stts);
+        }
     }
     # Person and number of finite verbs can be deduced from their subjects.
     # We have to do this in a separate loop, after all the pronouns have been solved.
@@ -863,6 +918,106 @@ sub fix_root_punct
     {
         $children[1]->set_parent($children[0]);
         $children[1]->set_deprel('punct');
+    }
+}
+
+
+
+#------------------------------------------------------------------------------
+# Unifies the relations of possessive determiners to det:poss. Before the fix,
+# some were nmod:poss and some were just det.
+#------------------------------------------------------------------------------
+sub fix_possessive_determiners
+{
+    my $self = shift;
+    my $root = shift;
+    my @nodes = $root->get_descendants();
+    foreach my $node (@nodes)
+    {
+        my $parent = $node->parent();
+        # Exclude nodes that have children, e.g. prepositions. They are probably not determiners.
+        # Either there is a tagging error (in "kam zu ihr", "ihr" is not possessive, it is the dative case of "sie"),
+        # or there is ellipsis and the possessive pronoun has been promoted to the place of the elided noun.
+        if($node->lemma() =~ m/^(mein|dein|sein|Ihr\|ihr|ihr|unser|euer)$/ && $node->is_possessive() && $node->deprel() =~ m/(nmod:poss|det)/ && $node->is_leaf())
+        {
+            $node->set_deprel('det:poss');
+        }
+    }
+}
+
+
+
+#------------------------------------------------------------------------------
+# Infinitive-marking "zu" is currently tagged PART and attached as aux. The tag
+# is OK (English "to" and Swedish "att" are also particle when used to mark
+# the infinitive; but Dutch "te" is tagged ADP). The relation is not OK. It
+# should be "mark".
+#------------------------------------------------------------------------------
+sub fix_infinitival_zu
+{
+    my $self = shift;
+    my $root = shift;
+    my @nodes = $root->get_descendants();
+    foreach my $node (@nodes)
+    {
+        my $parent = $node->parent();
+        if($node->form() =~ m/^zu$/i && $parent->is_verb() && $node->deprel() =~ m/^aux/)
+        {
+            $node->set_deprel('mark');
+        }
+    }
+}
+
+
+
+#------------------------------------------------------------------------------
+# Separable verb prefixes are currently attached to the verb as mark. That
+# differs from the other Germanic languages where they are attached as
+# compound:prt. Fix it and make it "compound:prt", too (relying on the
+# predicted STTS tags to identify the verb prefixes correctly).
+#------------------------------------------------------------------------------
+sub fix_separable_verb_prefixes
+{
+    my $self = shift;
+    my $root = shift;
+    my @nodes = $root->get_descendants();
+    foreach my $node (@nodes)
+    {
+        if($node->deprel() eq 'mark' && $node->conll_pos() eq 'PTKVZ')
+        {
+            $node->set_deprel('compound:prt');
+        }
+    }
+}
+
+
+
+#------------------------------------------------------------------------------
+# Sometimes the "mwe" relation connects a multi-word expression to its parent,
+# instead of connecting the members of the MWE together. We can only fix it by
+# consulting a list of potentially offending MWEs. For some of them we will not
+# even grant them the MWE status, as this should be very restricted in UD.
+#------------------------------------------------------------------------------
+sub fix_mwe
+{
+    my $self = shift;
+    my $root = shift;
+    my @nodes = $root->get_descendants();
+    foreach my $node (@nodes)
+    {
+        my $parent = $node->parent();
+        # Alles in Allem
+        if($node->form() =~ m/^alles$/i && $self->get_node_spanstring($node) =~ m/^alles in allem$/i)
+        {
+            my @subtree = $self->get_node_subtree($node);
+            # Make sure that the structure is nmod(Alles, Allem); case(Allem, in).
+            $subtree[2]->set_parent($node);
+            $subtree[2]->set_deprel('nmod');
+            $subtree[1]->set_parent($subtree[2]);
+            $subtree[1]->set_deprel('case');
+            # The relation to the parent of the MWE should be nmod (because "Alles" is pronoun), not mwe.
+            $node->set_deprel('nmod');
+        }
     }
 }
 
